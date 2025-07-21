@@ -1,0 +1,550 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sun Jul 20 12:35:42 2025
+
+@author: amits
+"""
+
+# -*- coding: utf-8 -*-
+
+
+"""
+Fixed Income Portfolio Tracking Error Analytics
+Complete implementation using only empirical data from last 5 years
+"""
+
+import pandas as pd
+import numpy as np
+import QuantLib as ql
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+today = ql.Date.todaysDate()
+
+# ============================================================================
+# STEP 1: DATA LOADING AND PREPROCESSING
+# ============================================================================
+
+def load_treasury_rates(file_path="Provide rates here"):
+    """
+    Load Treasury rates data
+    Columns: observation_date, GS1, GS2, GS3, GS4, GS5, GS07, GS10
+    """
+    rates_df = pd.read_excel(file_path)
+    
+    # Convert observation_date to datetime
+    rates_df['observation_date'] = pd.to_datetime(rates_df['observation_date'])
+    
+    # Set as index
+    rates_df.set_index('observation_date', inplace=True)
+    
+    # Rename columns for clarity
+    rates_df.columns = ['1Y', '2Y', '3Y', '4Y', '5Y', '7Y', '10Y']
+    
+    # Convert from percentage to decimal if needed
+    if rates_df.iloc[0].max() > 1:
+        rates_df = rates_df / 100
+    
+    return rates_df
+
+def load_bond_holdings(file_path="Provide Portfolio holdings here"):
+    """
+    Load bond holdings data
+    Key columns: Security, Portfolio/Benchmark, Notional exposure$, 
+                Issue Date, Call date, Maturity, Coupon
+    """
+    holdings_df = pd.read_excel(file_path)
+    
+    # Convert date columns
+    date_columns = ['Issue Date', 'Call date', 'Maturity']
+    for col in date_columns:
+        holdings_df[col] = pd.to_datetime(holdings_df[col])
+    
+    # Convert coupon to decimal if needed
+    if holdings_df['Coupon'].max() > 1:
+        holdings_df['Coupon'] = holdings_df['Coupon'] / 100
+    
+    return holdings_df
+
+# ============================================================================
+# STEP 2: CALCULATE MONTHLY CHANGES AND COVARIANCE MATRIX (LAST 5 YEARS)
+# ============================================================================
+
+def calculate_covariance_matrix(rates_df, years_back=5):
+    """
+    Calculate annualized covariance matrix from monthly rate changes
+    Using only the last 5 years of data (60 months)
+    """
+    # Filter to last 5 years only
+    end_date = rates_df.index[-1]
+    start_date = end_date - pd.DateOffset(years=years_back)
+    recent_rates = rates_df[rates_df.index >= start_date]
+    
+    print(f"   Using data from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+    print(f"   Number of observations: {len(recent_rates)}")
+    
+    # Resample to monthly if not already
+    monthly_rates = recent_rates.resample('M').last()
+    
+    # Calculate monthly changes (not returns, but absolute changes)
+    monthly_changes = monthly_rates.diff().dropna()
+    
+    print(f"   Monthly changes calculated: {len(monthly_changes)} observations")
+    
+    # Calculate monthly covariance and correlation
+    monthly_cov = monthly_changes.cov()
+    monthly_corr = monthly_changes.corr()
+    
+    # Annualize covariance (multiply by 12)
+    annual_cov = monthly_cov * 12
+    
+    # Calculate annualized volatilities (multiply by sqrt(12))
+    annual_vol = monthly_changes.std() * np.sqrt(12)
+    
+    return annual_cov, annual_vol, monthly_changes, monthly_corr
+
+# ============================================================================
+# STEP 3: KRD CALCULATION USING QUANTLIB
+# ============================================================================
+
+def setup_quantlib():
+    """Initialize QuantLib settings"""
+    calendar = ql.UnitedStates(ql.UnitedStates.GovernmentBond)
+    today = ql.Date.todaysDate()
+    ql.Settings.instance().evaluationDate = today
+    return calendar, today
+
+def create_yield_curve(rates_dict, evaluation_date):
+    """
+    Create QuantLib yield curve from rate dictionary using bond helpers
+    rates_dict: {'1Y': 0.0395, '2Y': 0.0378, '3Y': 0.0365, '4Y': 0.03845, '5Y': 0.0391, '7Y': 0.0405, '10Y': 0.0420}
+    """
+    # Set up calendar and settlement
+    calendar = ql.UnitedStates(ql.UnitedStates.GovernmentBond)
+    settlement_days = 1
+    face_value = 100
+    
+    # Map tenors to dates
+    tenor_map = {'1Y': 1, '2Y': 2, '3Y': 3, '4Y': 4, '5Y': 5, '7Y': 7, '10Y': 10}
+    
+    dates = []
+    rates = []
+    
+    for tenor, years in tenor_map.items():
+        if tenor in rates_dict:
+            date = evaluation_date + ql.Period(years, ql.Years)
+            dates.append(date)
+            rates.append(rates_dict[tenor])
+    
+    # Sort by date to ensure proper ordering
+    sorted_pairs = sorted(zip(dates, rates), key=lambda x: x[0])
+    dates, rates = zip(*sorted_pairs)
+    
+    # Build curve using bond helpers
+    bond_helpers = []
+    for d, r in zip(dates, rates):
+        price = 100 * np.exp(-r * ql.ActualActual(ql.ActualActual.Bond).yearFraction(evaluation_date, d))
+        
+        # Create schedule with only maturity payment (no intermediate coupons)
+        helper_schedule = ql.Schedule(evaluation_date, d, ql.Period(ql.Once), calendar, 
+                                    ql.Unadjusted, ql.Unadjusted, 
+                                    ql.DateGeneration.Backward, False)
+        
+        helper = ql.FixedRateBondHelper(
+            ql.QuoteHandle(ql.SimpleQuote(price)),
+            settlement_days, 
+            face_value, 
+            helper_schedule, 
+            [0.0],  # Zero coupon rate
+            ql.ActualActual(ql.ActualActual.Bond)
+        )
+        bond_helpers.append(helper)
+    
+    curve = ql.PiecewiseLinearZero(evaluation_date, bond_helpers, ql.ActualActual(ql.ActualActual.Bond))
+    return ql.YieldTermStructureHandle(curve)
+
+def build_curve_from_zeros(dates, rates, calendar, settlement_days = 1, face_value  = 100):
+    bond_helpers = []
+    for d, r in zip(dates, rates):
+        price = 100 * np.exp(-r * ql.ActualActual(ql.ActualActual.Bond).yearFraction(today, d))
+        # Create schedule with only maturity payment (no intermediate coupons)
+        helper_schedule = ql.Schedule(today, d, ql.Period(ql.Once), calendar, 
+                                    ql.Unadjusted, ql.Unadjusted, 
+                                    ql.DateGeneration.Backward, False)
+        
+        helper = ql.FixedRateBondHelper(
+            ql.QuoteHandle(ql.SimpleQuote(price)),
+            settlement_days, 
+            face_value, 
+            helper_schedule, 
+            [0.0],  # Zero coupon rate
+            ql.ActualActual(ql.ActualActual.Bond)
+        )
+        bond_helpers.append(helper)
+    
+    curve = ql.PiecewiseLinearZero(today, bond_helpers, ql.ActualActual(ql.ActualActual.Bond))
+    return ql.YieldTermStructureHandle(curve)
+
+def calculate_bond_krd(bond_data, yield_curve_handle, calendar, zero_rates, key_tenors=[1, 2, 3, 4, 5, 7, 10]):
+    """
+    Calculate KRDs for a single bond
+    """
+    # Extract bond parameters
+    issue_date = ql.Date(bond_data['Issue Date'].day, 
+                        bond_data['Issue Date'].month, 
+                        bond_data['Issue Date'].year)
+    maturity_date = ql.Date(bond_data['Maturity'].day, 
+                           bond_data['Maturity'].month, 
+                           bond_data['Maturity'].year)
+    coupon_rate = bond_data['Coupon']
+    # notional = bond_data['Notional exposure$']
+    
+    # Check if callable
+    call_date = None
+    if pd.notna(bond_data['Call date']):
+        call_date = ql.Date(bond_data['Call date'].day, 
+                           bond_data['Call date'].month, 
+                           bond_data['Call date'].year)
+    
+    # Create bond schedule
+    schedule = ql.Schedule(issue_date, maturity_date, ql.Period(ql.Annual),
+                          calendar, ql.Unadjusted, ql.Unadjusted,
+                          ql.DateGeneration.Backward, False)
+    
+    # Create bond object
+    if call_date:
+        # Callable bond
+        callability_schedule = ql.CallabilitySchedule()
+        callability_schedule.append(
+            ql.Callability(
+                ql.BondPrice(100.0, ql.BondPrice.Clean),
+                ql.Callability.Call,
+                call_date
+            )
+        )
+        bond = ql.CallableFixedRateBond(1, 100, schedule, [coupon_rate],
+                                        ql.ActualActual(ql.ActualActual.Bond),
+                                        ql.Following, 100.0, issue_date, 
+                                        callability_schedule)
+        # Set pricing engine
+        hw_model = ql.HullWhite(yield_curve_handle, a=0.03, sigma=0.015)
+        engine = ql.TreeCallableFixedRateBondEngine(hw_model, 500)
+        bond.setPricingEngine(engine)
+    else:
+        # Regular bond
+        bond = ql.FixedRateBond(1, 100, schedule, [coupon_rate],
+                               ql.ActualActual(ql.ActualActual.Bond))
+        engine = ql.DiscountingBondEngine(yield_curve_handle)
+        bond.setPricingEngine(engine)
+    
+    # Calculate base price
+    base_price = bond.cleanPrice()
+    
+    # Generate dates for all 7 tenors
+    zero_dates = []
+    tenor_years = [1, 2, 3, 4, 5, 7, 10]
+    for years in tenor_years:
+        tenor_date = ql.Settings.instance().evaluationDate + ql.Period(years, ql.Years)
+        zero_dates.append(tenor_date)
+    
+    today = ql.Date.todaysDate()
+    
+    def calculate_krd(key_rate_index, shift_size=0.0001):
+        """
+        KRD using interpolated key rate shifts
+        """
+        # Calculate time to each key rate maturity
+        key_times = [ql.ActualActual(ql.ActualActual.Bond).yearFraction(today, d) for d in zero_dates]
+        
+        def create_bump_function(key_times, bump_size):
+            # Simple approach: bump only the exact key rate
+            bump_vector = [0.0] * len(key_times)
+            bump_vector[key_rate_index] = bump_size
+            return bump_vector
+        
+        # Calculate price with positive bump
+        bump_up = create_bump_function(key_times, shift_size)
+        rates_up = [r + b for r, b in zip(zero_rates.values(), bump_up)]
+        curve_up = build_curve_from_zeros(zero_dates, rates_up, calendar)
+        
+        if call_date:
+            hw_model_up = ql.HullWhite(curve_up, a=0.03, sigma=0.015)
+            bond.setPricingEngine(ql.TreeCallableFixedRateBondEngine(hw_model_up, 500))
+        else:
+            bond.setPricingEngine(ql.DiscountingBondEngine(curve_up))
+        price_up = bond.cleanPrice()
+        
+        # Calculate price with negative bump
+        bump_down = create_bump_function(key_times, -shift_size)
+        rates_down = [r + b for r, b in zip(zero_rates.values(), bump_down)]
+        curve_down = build_curve_from_zeros(zero_dates, rates_down, calendar)
+        
+        if call_date:
+            hw_model_down = ql.HullWhite(curve_down, a=0.03, sigma=0.015)
+            bond.setPricingEngine(ql.TreeCallableFixedRateBondEngine(hw_model_down, 500))
+        else:
+            bond.setPricingEngine(ql.DiscountingBondEngine(curve_down))
+        price_down = bond.cleanPrice()
+        
+        # Calculate KRD
+        krd = (price_down - price_up) / (2 * base_price * shift_size)
+        # Calculate Key Rate Convexity
+        key_rate_convexity = (price_up + price_down - 2 * base_price) / (base_price * shift_size**2)
+        return krd, price_up, price_down, key_rate_convexity
+        
+    # Calculate KRDs for all tenors
+    KRDs = []
+    for i, (date, rate) in enumerate(zip(zero_dates, zero_rates.values())):
+        shift = 0.0001  # 1 bp
+        tenor_years = ql.ActualActual(ql.ActualActual.Bond).yearFraction(today, date)
+        krd_val, price_up, price_down, key_rate_convexity = calculate_krd(i, shift)
+        
+        KRDs.append({
+            'Index': i,
+            'Tenor': f"{tenor_years:.1f}Y",
+            'Base_Rate_%': rate*100,
+            'Price_Up': price_up,
+            'Price_Down': price_down,
+            'Price_Change_Up': price_up - base_price,
+            'Price_Change_Down': price_down - base_price,
+            'KRD': krd_val,
+            'Key_Rate_Convexity': key_rate_convexity
+        })
+        
+    return KRDs, base_price
+
+# ============================================================================
+# STEP 4: AGGREGATE KRDs BY PORTFOLIO/BENCHMARK
+# ============================================================================
+
+def calculate_portfolio_krds(holdings_df, current_rates):
+    """
+    Calculate aggregate KRDs for portfolio and benchmark
+    """
+    calendar, evaluation_date = setup_quantlib()
+    yield_curve = create_yield_curve(current_rates, evaluation_date)
+    
+    portfolio_krds = {'1Y': 0, '2Y': 0, '3Y': 0, '4Y': 0, '5Y': 0, '7Y': 0, '10Y': 0}
+    benchmark_krds = {'1Y': 0, '2Y': 0, '3Y': 0, '4Y': 0, '5Y': 0, '7Y': 0, '10Y': 0}
+    
+    results = []
+    
+    for idx, bond in holdings_df.iterrows():
+        try:
+            # Calculate KRDs for this bond
+            bond_krds, base_price = calculate_bond_krd(bond, yield_curve, calendar, current_rates)
+            
+            # Add to appropriate bucket
+            if bond['Portfolio/Benchmark'] == 'Portfolio':
+                for krd_dict in bond_krds:
+                    tenor = f"{int(float(krd_dict['Tenor'][:-1]))}Y"  # '1.0Y' -> '1Y'
+                    krd_value = krd_dict['KRD']
+                    if tenor in portfolio_krds:
+                        portfolio_krds[tenor] += krd_value
+            else:
+                for krd_dict in bond_krds:
+                    tenor = f"{int(float(krd_dict['Tenor'][:-1]))}Y"  # '1.0Y' -> '1Y'
+                    krd_value = krd_dict['KRD']
+                    if tenor in benchmark_krds:
+                        benchmark_krds[tenor] += krd_value
+            
+            # Store results
+            result = {
+                'Security': bond['Security'],
+                'Type': bond['Portfolio/Benchmark'],
+                'Base_Price': base_price,
+                'KRDs': bond_krds
+            }
+            results.append(result)
+            
+        except Exception as e:
+            print(f"Error processing bond {bond['Security']}: {e}")
+    
+    return portfolio_krds, benchmark_krds, pd.DataFrame(results)
+
+# ============================================================================
+# STEP 5-9: TE CALCULATIONS (USING EMPIRICAL DATA ONLY)
+# ============================================================================
+
+def calculate_te_analytics(portfolio_krds, benchmark_krds, annual_vol, annual_cov, empirical_corr):
+    """
+    Calculate all TE analytics using ONLY empirical data
+    """
+    # Step 4: Net KRD
+    net_krds = {}
+    for tenor in ['1Y', '2Y', '3Y', '4Y', '5Y', '7Y', '10Y']:
+        net_krds[tenor] = portfolio_krds[tenor] - benchmark_krds[tenor]
+    
+    # Convert to array for matrix operations
+    tenor_order = ['1Y', '2Y', '3Y', '4Y', '5Y', '7Y', '10Y']
+    net_krd_array = np.array([net_krds[t] for t in tenor_order])
+    vol_array = np.array([annual_vol[t] for t in tenor_order])
+    cov_matrix = annual_cov[tenor_order].loc[tenor_order].values
+    
+    # Get empirical correlation matrix
+    correlation_matrix = empirical_corr[tenor_order].loc[tenor_order].values
+    
+    # Step 5: TE impact of isolated 1 std dev change
+    te_isolated = {}
+    for i, tenor in enumerate(tenor_order):
+        te_isolated[tenor] = abs(net_krd_array[i] * vol_array[i])
+    
+    # Step 6: TE impact of correlated 1 std dev change (USING EMPIRICAL CORRELATIONS)
+    te_correlated = {}
+    for i, tenor in enumerate(tenor_order):
+        # When tenor i moves 1σ, others move by empirical correlation * 1σ
+        total_impact = 0
+        for j in range(len(tenor_order)):
+            impact = net_krd_array[j] * vol_array[j] * correlation_matrix[i, j]
+            total_impact += impact
+        te_correlated[tenor] = abs(total_impact)
+    
+    # Step 7: Calculate total TE
+    total_te_squared = np.dot(net_krd_array, np.dot(cov_matrix, net_krd_array))
+    total_te = np.sqrt(total_te_squared)
+    
+    # Step 8: Marginal contribution
+    if total_te > 0:
+        cov_times_weights = np.dot(cov_matrix, net_krd_array)
+        marginal_te = cov_times_weights / total_te
+    else:
+        marginal_te = np.zeros(len(tenor_order))
+    
+    # Step 9: Contribution to TE
+    contribution_to_te = net_krd_array * marginal_te
+    
+    # Step 10: % of tracking error
+    pct_of_te = {}
+    for i, tenor in enumerate(tenor_order):
+        if total_te > 0:
+            pct_of_te[tenor] = (contribution_to_te[i] / total_te) * 100
+        else:
+            pct_of_te[tenor] = 0
+    
+    # Create results dictionary
+    results = {
+        'Portfolio_KRD': portfolio_krds,
+        'Benchmark_KRD': benchmark_krds,
+        'Net_KRD': net_krds,
+        'Factor_Vol': {t: vol_array[i] for i, t in enumerate(tenor_order)},
+        'TE_Impact_Isolated': te_isolated,
+        'TE_Impact_Correlated': te_correlated,
+        'Marginal_TE': {t: marginal_te[i] for i, t in enumerate(tenor_order)},
+        'Contribution_to_TE': {t: contribution_to_te[i] for i, t in enumerate(tenor_order)},
+        'Pct_of_TE': pct_of_te,
+        'Total_TE': total_te,
+        'Empirical_Correlation': correlation_matrix
+    }
+    
+    return results
+
+# ============================================================================
+# MAIN EXECUTION FUNCTION
+# ============================================================================
+
+def run_te_analytics(rates_file='All Constant Maturity TREas rates.xlsx',
+                     holdings_file='Bond holdings.xlsx'):
+    """
+    Main function to run complete TE analytics using empirical data only
+    """
+    print("Fixed Income Portfolio Tracking Error Analytics")
+    print("Using EMPIRICAL DATA ONLY (Last 5 Years)")
+    print("=" * 80)
+    
+    # Step 1: Load data
+    print("\n1. Loading data...")
+    rates_df = load_treasury_rates(rates_file)
+    holdings_df = load_bond_holdings(holdings_file)
+    print(f"   Loaded {len(rates_df)} months of rate data")
+    print(f"   Loaded {len(holdings_df)} bond holdings")
+    
+    # Step 2: Calculate covariance matrix (LAST 5 YEARS ONLY)
+    print("\n2. Calculating covariance matrix from last 5 years...")
+    annual_cov, annual_vol, monthly_changes, empirical_corr = calculate_covariance_matrix(rates_df, years_back=5)
+    
+    print("   Annual volatilities:")
+    for tenor, vol in annual_vol.items():
+        print(f"   {tenor}: {vol*100:.2f}%")
+    
+    print("\n   Empirical correlations (sample):")
+    print("   1Y-2Y:", f"{empirical_corr.loc['1Y', '2Y']:.3f}")
+    print("   2Y-5Y:", f"{empirical_corr.loc['2Y', '5Y']:.3f}")
+    print("   5Y-10Y:", f"{empirical_corr.loc['5Y', '10Y']:.3f}")
+    
+    # Step 3: Calculate KRDs
+    print("\n3. Calculating Key Rate Durations...")
+    current_rates = rates_df.iloc[-1].to_dict()  # Use most recent rates
+    portfolio_krds, benchmark_krds, bond_details = calculate_portfolio_krds(holdings_df, current_rates)
+    
+    # Steps 4-9: TE calculations (USING EMPIRICAL DATA)
+    print("\n4-9. Calculating TE metrics using empirical correlations...")
+    te_results = calculate_te_analytics(portfolio_krds, benchmark_krds, annual_vol, annual_cov, empirical_corr)
+    
+    # Create output table
+    print("\n" + "=" * 140)
+    print("TRACKING ERROR ANALYTICS SUMMARY (EMPIRICAL DATA ONLY)")
+    print("=" * 140)
+    
+    # Create DataFrame for display
+    results_data = []
+    for tenor in ['1Y', '2Y', '3Y', '4Y', '5Y', '7Y', '10Y']:
+        row = {
+            'Tenor': tenor,
+            'Portfolio_KRD': f"{portfolio_krds[tenor]:.4f}",
+            'Benchmark_KRD': f"{benchmark_krds[tenor]:.4f}",
+            'Net_KRD': f"{te_results['Net_KRD'][tenor]:.4f}",
+            'Factor_Vol_%': f"{te_results['Factor_Vol'][tenor]*100:.2f}",
+            'TE_Isolated_bps': f"{te_results['TE_Impact_Isolated'][tenor]*10000:.2f}",
+            'TE_Correlated_bps': f"{te_results['TE_Impact_Correlated'][tenor]*10000:.2f}",
+            'Marginal_TE': f"{te_results['Marginal_TE'][tenor]:.4f}",
+            'Contribution_bps': f"{te_results['Contribution_to_TE'][tenor]*10000:.2f}",
+            'Pct_of_TE': f"{te_results['Pct_of_TE'][tenor]:.1f}%"
+        }
+        results_data.append(row)
+    
+    results_df = pd.DataFrame(results_data)
+    print(results_df.to_string(index=False))
+    
+    print("\n" + "-" * 140)
+    print(f"TOTAL TRACKING ERROR: {te_results['Total_TE']*10000:.2f} basis points")
+    print("-" * 140)
+    
+    # Additional summary statistics
+    print("\nPORTFOLIO SUMMARY:")
+    print(f"Portfolio Duration: {sum(portfolio_krds.values()):.2f} years")
+    print(f"Benchmark Duration: {sum(benchmark_krds.values()):.2f} years")
+    print(f"Active Duration: {sum(te_results['Net_KRD'].values()):.2f} years")
+    
+    # Save results to Excel
+    with pd.ExcelWriter('TE_Analytics_Results_Empirical.xlsx') as writer:
+        results_df.to_excel(writer, sheet_name='TE_Summary', index=False)
+        bond_details.to_excel(writer, sheet_name='Bond_Details', index=False)
+        
+        # Save covariance matrix
+        cov_df = pd.DataFrame(annual_cov, index=['1Y', '2Y', '3Y', '4Y', '5Y', '7Y', '10Y'], 
+                             columns=['1Y', '2Y', '3Y', '4Y', '5Y', '7Y', '10Y'])
+        cov_df.to_excel(writer, sheet_name='Covariance_Matrix')
+        
+        # Save correlation matrix
+        corr_df = pd.DataFrame(empirical_corr, index=['1Y', '2Y', '3Y', '4Y', '5Y', '7Y', '10Y'], 
+                              columns=['1Y', '2Y', '3Y', '4Y', '5Y', '7Y', '10Y'])
+        corr_df.to_excel(writer, sheet_name='Correlation_Matrix')
+        
+        # Save monthly changes for inspection
+        monthly_changes.to_excel(writer, sheet_name='Monthly_Changes')
+    
+    print("\nResults saved to 'TE_Analytics_Results_Empirical.xlsx'")
+    print("✓ Removed hardcoded correlations")
+    print("✓ Using last 5 years of empirical data only")
+    print("✓ All 7 tenors included: 1Y, 2Y, 3Y, 4Y, 5Y, 7Y, 10Y")
+    
+    return te_results, results_df, bond_details
+
+# ============================================================================
+# EXECUTE THE ANALYSIS
+# ============================================================================
+
+if __name__ == "__main__":
+    # Run the complete TE analytics with empirical data only
+    te_results, summary_df, bond_details = run_te_analytics()
